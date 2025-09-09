@@ -1,5 +1,5 @@
-/* public/sw.js — patched */
-const VERSION = "magang-app-v1.0.31";
+/* public/sw.js — fast offline upload with timeout & ACK */
+const VERSION = "magang-app-v1.0.33";
 const STATIC_CACHE  = VERSION + "-static";
 const DYNAMIC_CACHE = VERSION + "-dynamic";
 
@@ -14,12 +14,14 @@ const APP_SHELL = [
   "/icon-512x512.png",
 ];
 
-/* ===== IndexedDB Queue (upload offline) ===== */
+/* ===== Config upload/meta ===== */
 const QUEUE_DB = "photo-upload-queue-db";
 const QUEUE_STORE = "requests";
-const UPLOAD_PATH = "/api/job-photos/upload"; // HARUS sama dengan client
+const UPLOAD_PATH = "/api/job-photos/upload";
 const META_PATH   = "/api/job-photos/meta";
+const UPLOAD_TIMEOUT_MS = 2500; // ⬅️ kalau fetch > 2.5s → antre, UI langsung dapat respons
 
+/* ===== IndexedDB (queue) ===== */
 function idbOpen() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(QUEUE_DB, 2);
@@ -75,7 +77,7 @@ function sanitizeHeaders(raw) {
   if (!raw) return h;
   for (const k in raw) {
     const lk = k.toLowerCase();
-    if (["content-length", "connection", "keep-alive", "proxy-connection", "transfer-encoding"].includes(lk)) continue;
+    if (["content-length","connection","keep-alive","proxy-connection","transfer-encoding"].includes(lk)) continue;
     h[lk] = raw[k];
   }
   return h;
@@ -110,7 +112,7 @@ async function processQueue() {
   if (okIds.length) await notifyClients({ type: "sync-complete", queueIds: okIds });
 }
 
-/* ===== Utils cache ===== */
+/* ===== Cache utils ===== */
 async function precache(cache, urls) {
   await Promise.all(urls.map(async (u) => {
     try { await cache.add(new Request(u, { cache: "reload" })); } catch(_) {}
@@ -150,7 +152,6 @@ self.addEventListener("install", (e) => {
   })());
   self.skipWaiting();
 });
-
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys().then((keys) =>
@@ -188,12 +189,16 @@ self.addEventListener("fetch", (e) => {
   const req = e.request;
   const url = new URL(req.url);
 
-  // 0) Intercept upload/meta: online-first; gagal → antre
+  // 0) Intercept upload/meta: network-first with TIMEOUT; if slow/fail → enqueue
   if (req.method === "POST" && (url.pathname === UPLOAD_PATH || url.pathname === META_PATH)) {
     e.respondWith((async () => {
       try {
-        const onlineRes = await fetch(req.clone());
-        // Kirim ACK ke client kalau upload endpoint
+        const onlineRes = await Promise.race([
+          fetch(req.clone()),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), UPLOAD_TIMEOUT_MS)),
+        ]);
+
+        // ACK cepat ke client jika upload sukses
         if (url.pathname === UPLOAD_PATH) {
           try {
             const resClone = onlineRes.clone();
@@ -204,7 +209,7 @@ self.addEventListener("fetch", (e) => {
                 categoryId: data.categoryId || null,
                 thumbUrl: data.thumbUrl || null,
                 serialNumber: data.serialNumber || null,
-                meter: typeof data.meter === "number" ? data.meter : null
+                meter: typeof data.meter === "number" ? data.meter : null,
               });
               await notifyClients({ type: "persist-now" });
             }
@@ -212,12 +217,20 @@ self.addEventListener("fetch", (e) => {
         }
         return onlineRes;
       } catch {
-        // enqueue saat offline
+        // timeout / error → antre
         const body = await req.clone().arrayBuffer();
         const headers = {};
         req.headers.forEach((v, k) => (headers[k] = v));
         const id = Date.now() + "-" + Math.random().toString(36).slice(2);
-        await queueAdd({ id, url: req.url, method: "POST", headers, body, createdAt: Date.now(), kind: (url.pathname === META_PATH ? "meta" : "upload") });
+        await queueAdd({
+          id,
+          url: req.url,
+          method: "POST",
+          headers,
+          body,
+          createdAt: Date.now(),
+          kind: (url.pathname === META_PATH ? "meta" : "upload"),
+        });
         try {
           await self.registration.sync.register(url.pathname === META_PATH ? "meta-sync" : "photo-upload-sync");
         } catch(_) {}
@@ -235,7 +248,7 @@ self.addEventListener("fetch", (e) => {
   const accept = req.headers.get("accept") || "";
   const isHTML  = req.mode === "navigate" || accept.includes("text/html");
 
-  // 1) HTML → network-first; cache
+  // 1) HTML → network-first; fallback cache/offline
   if (isHTML) {
     e.respondWith((async () => {
       try {
@@ -294,7 +307,7 @@ self.addEventListener("fetch", (e) => {
     return;
   }
 
-  // 4) Lainnya → network-first biasa
+  // 4) Default → network-first; fallback cache
   e.respondWith((async () => {
     try { return await fetch(req); }
     catch { return (await caches.match(req, { ignoreSearch: true })) || Response.error(); }
