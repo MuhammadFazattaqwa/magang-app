@@ -14,8 +14,7 @@ import ReactCrop, { type Crop, type PixelCrop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
 
 // OCR SN
-import type { OcrInfo } from "@/lib/ocr";
-import { recognizeSerialNumber } from "@/lib/ocr";
+import { type OcrInfo, recognizeSerialNumber } from "@/lib/ocr";
 // Auto-crop
 import { suggestAutoCrop } from "@/lib/auto-crop";
 // Util gambar
@@ -40,9 +39,9 @@ interface PhotoCategory {
   id: string;
   name: string;
   requiresSerialNumber: boolean;
-  photo?: string;          // url full
-  photoThumb?: string;     // url thumb (online)
-  offlineThumb?: string;   // dataURL thumb (offline cache)
+  photo?: string;
+  photoThumb?: string;
+  offlineThumb?: string;
   serialNumber?: string;
   snDraft?: string;
   meter?: number;
@@ -122,6 +121,28 @@ async function urlToDataUrl(u: string): Promise<string> {
     fr.onload = () => resolve(fr.result as string);
     fr.readAsDataURL(b);
   });
+}
+
+/* === NEW: downscale blob sebelum upload (lebih cepat) === */
+async function downscaleBlobMax(
+  src: Blob,
+  maxSide = 1600,
+  mime = "image/jpeg",
+  quality = 0.82
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(src);
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d")!;
+  (ctx as any).imageSmoothingEnabled = true;
+  (ctx as any).imageSmoothingQuality = "high";
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const blob: Blob = await new Promise((res) => c.toBlob((b) => res(b as Blob), mime, quality));
+  bitmap.close();
+  return blob;
 }
 
 /* ===== API helper: refetch kategori ===== */
@@ -544,53 +565,57 @@ export default function UploadFotoClient() {
     onImageLoaded(imgRef.current);
   }, [aspect]);
 
-  // === OCR SN (versi tanpa 'mode') ===
-  async function runOCR_SN(catId: string, sources: (Blob | string)[], token: number) {
+  // === OCR SN (dipanggil di background) ===
+  async function runOCR_SN(catId: string, src: string, token: number) {
     setOcr((prev) => ({ ...prev, [catId]: { status: "barcode", progress: 0 } }));
-
-    let sn: string | null = null;
-
-    for (let i = 0; i < sources.length; i++) {
-      const src = sources[i];
-
-      sn = await recognizeSerialNumber(src, {
-        onProgress: (info: OcrInfo) => {
-          setOcr((prev) => ({ ...prev, [catId]: info }));
-        },
-        enableBarcode: true,
-        timeBudgetMs: 1500,          // batasi waktu OCR lokal
-        enableServerFallback: true,  // coba OCR server jika online
-      });
-
-      if (sn) break;
-      if (i === 0) setOcr((prev) => ({ ...prev, [catId]: { status: "ocr", progress: 5 } }));
-    }
-
-    if (sn) {
+    // FAST dulu
+    const snFast = await recognizeSerialNumber(src, {
+      onProgress: (info: OcrInfo) => setOcr((prev) => ({ ...prev, [catId]: info })),
+      enableBarcode: true,
+      mode: "fast",
+    });
+    if (snFast) {
       setCategories(prev => {
-        const next = prev.map((c) => (c.id === catId && c.photoToken === token ? { ...c, serialNumber: sn! } : c));
+        const next = prev.map((c) => (c.id === catId && c.photoToken === token ? { ...c, serialNumber: snFast } : c));
         persistSnapshotNow(cacheKey, next);
         return next;
       });
+      await saveMeta(jobId, catId, { serialNumber: snFast, ocrStatus: "done" });
       setOcr((prev) => ({ ...prev, [catId]: { status: "done", progress: 100 } }));
-      await saveMeta(jobId, catId, { serialNumber: sn, ocrStatus: "done" });
-      persistSnapshotNow(cacheKey, categoriesRef.current);
-    } else {
-      setOcr((prev) => ({ ...prev, [catId]: { status: "error", progress: 0, error: "SN tidak terdeteksi." } }));
-      await saveMeta(jobId, catId, { serialNumber: null, ocrStatus: "done" });
-      persistSnapshotNow(cacheKey, categoriesRef.current);
+      return;
     }
+    // DEEP saat idle
+    (window.requestIdleCallback || window.setTimeout)(async () => {
+      const snDeep = await recognizeSerialNumber(src, {
+        onProgress: (info: OcrInfo) => setOcr((prev) => ({ ...prev, [catId]: info })),
+        enableBarcode: true,
+        mode: "deep",
+      });
+      if (snDeep) {
+        setCategories(prev => {
+          const next = prev.map((c) => (c.id === catId && c.photoToken === token ? { ...c, serialNumber: snDeep } : c));
+          persistSnapshotNow(cacheKey, next);
+          return next;
+        });
+        await saveMeta(jobId, catId, { serialNumber: snDeep, ocrStatus: "done" });
+        setOcr((prev) => ({ ...prev, [catId]: { status: "done", progress: 100 } }));
+      } else {
+        setOcr((prev) => ({ ...prev, [catId]: { status: "error", progress: 0, error: "SN tidak terdeteksi." } }));
+        await saveMeta(jobId, catId, { serialNumber: null, ocrStatus: "done" });
+      }
+    }, 0 as any);
   }
 
   /* ============== KONFIRM CROP → upload via safeUpload (offline-ready) ============== */
-  const [saving, setSaving] = useState(false); // untuk animasi tombol
   const handleConfirmCrop = async () => {
     if (!imgRef.current || !completedCrop || !pendingCategoryId) return;
-    setSaving(true);
 
-    const fullBlob = await cropElToBlob(imgRef.current, completedCrop);
+    // hasil crop asli
+    const fullBlobRaw = await cropElToBlob(imgRef.current, completedCrop);
+    // kecilkan supaya upload cepat
+    const fullBlob = await downscaleBlobMax(fullBlobRaw, 1600, "image/jpeg", 0.82);
+    // thumbnail
     const thumbBlob = await makeThumbnail(fullBlob, 640, true, 0.8);
-
     const [, thumbDataUrl] = await Promise.all([blobToDataUrl(fullBlob), blobToDataUrl(thumbBlob)]);
     const token = Date.now();
 
@@ -601,6 +626,7 @@ export default function UploadFotoClient() {
     const parsed = parseFloat(draft.replace(",", "."));
     const meterVal = isCable && !Number.isNaN(parsed) && parsed >= 0 ? parsed : undefined;
 
+    // 1) UI duluan
     const initialState: PhotoCategory["uploadState"] = online ? "uploading" : "queued";
     setCategories(prev => {
       const next = prev.map((c) =>
@@ -620,80 +646,63 @@ export default function UploadFotoClient() {
       return next;
     });
 
-    try {
-      const fd = new FormData();
-      const fileName = `job-${jobId || "NA"}-cat-${pendingCategoryId}-${token}.jpg`;
-      fd.append("photo", new File([fullBlob], fileName, { type: "image/jpeg" }));
-      fd.append("thumb", new File([thumbBlob], `thumb-${fileName}`, { type: "image/jpeg" }));
-      fd.append("jobId", jobId);
-      fd.append("categoryId", pendingCategoryId);
-      if (typeof meterVal === "number") fd.append("meter", String(meterVal));
-      if (cat?.requiresSerialNumber && cat.serialNumber) fd.append("serialNumber", cat.serialNumber);
-
-      const result: any = await safeUpload({
-        endpoint: UPLOAD_ENDPOINT,
-        formData: fd,
-        meta: { jobId, categoryId: pendingCategoryId, token },
-      });
-
-      if (result?.status === "uploaded") {
-        setCategories(prev => {
-          const next = prev.map((c) =>
-            c.id === pendingCategoryId ? { ...c, uploadState: "uploaded" as const, queueId: undefined, uploadError: undefined } : c
-          );
-          persistSnapshotNow(cacheKey, next);
-          return next;
-        });
-      } else if (result?.status === "queued") {
-        setCategories(prev => {
-          const next = prev.map((c) =>
-            c.id === pendingCategoryId ? { ...c, uploadState: "queued" as const, queueId: result.queueId as string, uploadError: undefined } : c
-          );
-          persistSnapshotNow(cacheKey, next);
-          return next;
-        });
-      } else {
-        const msg = result?.httpStatus ? `HTTP ${result.httpStatus}${result.message ? ` — ${result.message}` : ""}` : result?.message || "Gagal upload";
-        setCategories(prev => {
-          const next = prev.map((c) =>
-            c.id === pendingCategoryId ? { ...c, uploadState: "error" as const, uploadError: msg } : c
-          );
-          persistSnapshotNow(cacheKey, next);
-          return next;
-        });
-      }
-    } catch {
-      setCategories(prev => {
-        const next = prev.map((c) =>
-          c.id === pendingCategoryId ? { ...c, uploadState: "queued" as const, uploadError: undefined } : c
-        );
-        persistSnapshotNow(cacheKey, next);
-        return next;
-      });
-    } finally {
-      setSaving(false);
-    }
-
-    // simpan META meter
-    if (typeof meterVal === "number") {
-      await saveMeta(jobId, pendingCategoryId, { meter: meterVal, ocrStatus: "done" });
-      persistSnapshotNow(cacheKey, categoriesRef.current);
-    }
-
-    // OCR SN (async, tanpa menghambat UI)
-    if (cat?.requiresSerialNumber && !cat.serialNumber) {
-      const expandedCropDataUrl = await cropElToDataUrl(imgRef.current, completedCrop, 0.35);
-      const originalSrc = srcToCrop!;
-      runOCR_SN(pendingCategoryId, [expandedCropDataUrl, originalSrc], token); // tidak ditunggu
-    }
-
-    // reset & tutup modal
+    // 2) tutup modal biar terasa cepat
     resetFileInput(pendingCategoryId);
+    const thisCategoryId = pendingCategoryId;
     setCropOpen(false);
     setSrcToCrop(null);
     setPendingCategoryId(null);
     setIsPendingCable(false);
     setCableMeterDraft("");
+
+    // 3) upload di background
+    (async () => {
+      try {
+        const fd = new FormData();
+        const fileName = `job-${jobId || "NA"}-cat-${thisCategoryId}-${token}.jpg`;
+        fd.append("photo", new File([fullBlob], fileName, { type: "image/jpeg" }));
+        fd.append("thumb", new File([thumbBlob], `thumb-${fileName}`, { type: "image/jpeg" }));
+        fd.append("jobId", jobId);
+        fd.append("categoryId", thisCategoryId!);
+        if (typeof meterVal === "number") fd.append("meter", String(meterVal));
+        if (cat?.requiresSerialNumber && cat.serialNumber) fd.append("serialNumber", cat.serialNumber);
+
+        const result: any = await safeUpload({
+          endpoint: UPLOAD_ENDPOINT,
+          formData: fd,
+          meta: { jobId, categoryId: thisCategoryId, token },
+        });
+
+        if (result?.status === "uploaded") {
+          setCategories(prev => prev.map((c) =>
+            c.id === thisCategoryId ? { ...c, uploadState: "uploaded", queueId: undefined, uploadError: undefined } : c
+          ));
+        } else if (result?.status === "queued") {
+          setCategories(prev => prev.map((c) =>
+            c.id === thisCategoryId ? { ...c, uploadState: "queued", queueId: result.queueId as string, uploadError: undefined } : c
+          ));
+        } else {
+          const msg = result?.httpStatus ? `HTTP ${result.httpStatus}${result.message ? ` — ${result.message}` : ""}` : result?.message || "Gagal upload";
+          setCategories(prev => prev.map((c) =>
+            c.id === thisCategoryId ? { ...c, uploadState: "error", uploadError: msg } : c
+          ));
+        }
+      } catch {
+        setCategories(prev => prev.map((c) =>
+          c.id === thisCategoryId ? { ...c, uploadState: "queued", uploadError: undefined } : c
+        ));
+      }
+
+      if (typeof meterVal === "number") {
+        await saveMeta(jobId, thisCategoryId!, { meter: meterVal, ocrStatus: "done" });
+      }
+    })();
+
+    // 4) OCR benar2 background
+    if (cat?.requiresSerialNumber && !cat.serialNumber) {
+      const expandedCropDataUrl = await cropElToDataUrl(imgRef.current, completedCrop, 0.35);
+      setTimeout(() => runOCR_SN(thisCategoryId!, expandedCropDataUrl, token), 150);
+    }
   };
 
   const handleCancelCrop = () => {
@@ -769,7 +778,6 @@ export default function UploadFotoClient() {
 
                       <p className="text-xs font-medium text-center text-gray-700 px-1">{category.name}</p>
 
-                      {/* Status upload */}
                       {category.uploadState && (
                         <p className="text-[10px] text-center text-gray-600">
                           {category.uploadState === "uploaded" && "Terkirim ✔"}
@@ -783,7 +791,6 @@ export default function UploadFotoClient() {
                         </p>
                       )}
 
-                      {/* Kabel: panjang */}
                       {!category.requiresSerialNumber && (category.offlineThumb || category.photoThumb || category.photo) && isCableCategory(category.name) && (
                         <p className="text-[11px] text-gray-600 text-center">
                           {typeof category.meter === "number" ? (
@@ -794,7 +801,6 @@ export default function UploadFotoClient() {
                         </p>
                       )}
 
-                      {/* SN */}
                       {category.requiresSerialNumber && (category.offlineThumb || category.photoThumb || category.photo) && (
                         <div className="space-y-2">
                           {category.serialNumber ? (
@@ -846,7 +852,6 @@ export default function UploadFotoClient() {
                         </div>
                       )}
 
-                      {/* input file hidden */}
                       <input
                         ref={setFileInputRef(category.id)}
                         type="file"
@@ -873,7 +878,7 @@ export default function UploadFotoClient() {
         </div>
       </main>
 
-      {/* Modal Crop + input meter */}
+      {/* Modal Crop */}
       {cropOpen && srcToCrop && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
           <div className={`bg-white rounded-xl p-4 w-[92vw] ${isPortrait ? "max-w-[480px]" : "max-w-[720px]"}`}>
@@ -945,19 +950,8 @@ export default function UploadFotoClient() {
 
             <div className="mt-4 flex justify-end gap-2">
               <button onClick={handleCancelCrop} className="px-3 py-1.5 text-sm rounded border">Batal</button>
-              <button
-                onClick={handleConfirmCrop}
-                className="px-3 py-1.5 text-sm rounded bg-blue-600 text-white disabled:opacity-60 flex items-center gap-2"
-                disabled={!completedCrop || saving}
-              >
-                {saving ? (
-                  <>
-                    <span className="inline-block h-3 w-3 rounded-full border border-white border-t-transparent animate-spin" />
-                    Mengunggah...
-                  </>
-                ) : (
-                  "Simpan Crop"
-                )}
+              <button onClick={handleConfirmCrop} className="px-3 py-1.5 text-sm rounded bg-blue-600 text-white" disabled={!completedCrop}>
+                Simpan Crop
               </button>
             </div>
           </div>
