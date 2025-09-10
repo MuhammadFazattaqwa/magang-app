@@ -43,7 +43,7 @@ export default function ComplainPage() {
     const encodedMessage = encodeURIComponent(complaintText)
 
     // Admin WhatsApp number (placeholder)
-    const adminWhatsAppNumber = "628889110230"
+    const adminWhatsAppNumber = "6287811496128"
 
     // Open WhatsApp with pre-filled message
     const whatsappUrl = `https://wa.me/${adminWhatsAppNumber}?text=${encodedMessage}`
