@@ -5,54 +5,115 @@ export type OCRPhase = "idle" | "barcode" | "ocr" | "done" | "error"
 export interface OcrInfo { status: OCRPhase; progress: number; error?: string }
 export type OcrProgress = (info: OcrInfo) => void
 
+/* ================= Normalisasi & seleksi ================= */
+
 export function normalizeSN(val: string) {
-  let out = (val || "").trim().toUpperCase().replace(/\s+/g, "")
-  out = out.replace(/Q(?=\d)/g, "0").replace(/(?<=\d)O(?=\d)/g, "0").replace(/O(?=\d)/g, "0")
-  out = out.replace(/(?<=\d)[IL](?=\d)/g, "1").replace(/(?<=\d)B(?=\d)/g, "8").replace(/(?<=\d)S(?=\d)/g, "5")
-  return out.replace(/[^\w\-\/]/g, "")
+  let out = (val || "").trim().toUpperCase()
+
+  // potong di pemisah umum (revisi/suffix)
+  out = out.split(/[\/\\\s]/)[0] || out
+
+  out = out.replace(/\s+/g, "")
+  out = out
+    .replace(/Q(?=\d)/g, "0")
+    .replace(/(?<=\d)O(?=\d)/g, "0")
+    .replace(/O(?=\d)/g, "0")
+    .replace(/(?<=\d)[IL](?=\d)/g, "1")
+    .replace(/(?<=\d)B(?=\d)/g, "8")
+    .replace(/(?<=\d)S(?=\d)/g, "5")
+
+  return out.replace(/[^A-Z0-9\-]/g, "")
 }
+
+const COMMON_WORD = /^(MODEL|HIKVISION|DAHUA|NETWORK|CAMERA|SERIES|SKYHAWK|BULLET|ULTRA|SMART|ANPR|MP|CE|FCC)$/i
+
+function scoreCandidate(raw: string, nearLabel = false) {
+  const s = normalizeSN(raw)
+  if (!s) return -1
+  if (COMMON_WORD.test(s)) return -1
+
+  // hindari EAN/UPC all digits 12–14
+  if (/^\d{12,14}$/.test(s)) return -2
+
+  let score = 0
+  const L = s.length
+  if (L >= 8 && L <= 20) score += 6
+  else if (L >= 6) score += 3
+
+  if (/[A-Z]/.test(s) && /\d/.test(s)) score += 6
+  else if (/\d/.test(s)) score += 2
+
+  if (nearLabel) score += 6
+  return score
+}
+
 function selectBestSN(raw: string): string | null {
   const left = raw.split("/")[0]
-  const alnum = normalizeSN(left).replace(/[^A-Z0-9]/g, "")
-  if (raw.includes("/") && alnum.length >= 9) return alnum
-  if (/^\d{12,}$/.test(alnum)) return alnum
-  const m8 = alnum.match(/(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8}/)
+  const alnum = normalizeSN(left).replace(/[^A-Z0-9\-]/g, "")
+
+  // jika 9+ dan kombinasi huruf+angka → ok
+  if (alnum.length >= 9 && /[A-Z]/.test(alnum) && /\d/.test(alnum)) return alnum
+  // m8: minimal 8 kar. kombinasi
+  const m8 = alnum.match(/(?=[A-Z0-9\-]*[A-Z])(?=[A-Z0-9\-]*\d)[A-Z0-9\-]{8,}/)
   if (m8) return m8[0]
-  if (alnum.length >= 9 && alnum.length <= 20 && /[A-Z]/.test(alnum) && /\d/.test(alnum)) return alnum
+  // pure digit panjang (12+) — biasanya barcode, tapi masih kita ijinkan kalau ini yang tersisa
+  if (/^\d{12,}$/.test(alnum)) return alnum
   return alnum.length >= 8 ? alnum.slice(0, 8) : null
 }
+
+/* ================= Ekstraksi dari hasil OCR ================= */
+
 function extractSN(ocrText: string, words?: Array<{ text: string }>, lines?: Array<{ text: string }>) {
   const labelRe = /\b(?:S\/?N|SERIAL(?:\s*NO\.?|(?:\s*NUMBER)?))\b/i
-  for (const L of (lines || [])) {
-    if (labelRe.test(L.text)) {
-      const sn = selectBestSN((L.text.split(labelRe)[1] ?? ""))
-      if (sn) return sn
+  const candidates: Array<{ tok: string; near: boolean }> = []
+
+  // 1) Prioritas: baris yang mengandung label + baris berikutnya
+  const linesArr = (ocrText || "").replace(/\r/g, "").split("\n")
+  for (let i = 0; i < linesArr.length; i++) {
+    const L = linesArr[i].trim()
+    if (labelRe.test(L)) {
+      const right = L.replace(labelRe, "")
+      const m = right.match(/[A-Z0-9\-\/]{4,}/i)
+      if (m) candidates.push({ tok: m[0], near: true })
+      const next = (linesArr[i + 1] || "").trim()
+      const m2 = next.match(/^[\s:]*([A-Z0-9\-\/]{4,})/i)
+      if (m2) candidates.push({ tok: m2[1], near: true })
     }
   }
+
+  // 2) Token setelah kata “SN” pada level words (tambahan)
   if (words?.length) {
     for (let i = 0; i < words.length; i++) {
       if (labelRe.test(words[i].text)) {
-        const sn = selectBestSN([(words[i + 1]?.text ?? ""), (words[i + 2]?.text ?? "")].join(" "))
-        if (sn) return sn
+        const tok = [(words[i + 1]?.text ?? ""), (words[i + 2]?.text ?? "")].join(" ")
+        const sn = selectBestSN(tok)
+        if (sn) candidates.push({ tok: sn, near: true })
       }
     }
   }
+
+  // 3) Fallback: token panjang global (hindari kata umum)
   const T = (ocrText || "").toUpperCase()
-  const mg = T.match(new RegExp(labelRe.source + String.raw`\s*[:#-]?\s*([A-Z0-9\s\-\/]{5,})`, "i"))
-  if (mg?.[1]) {
-    const sn = selectBestSN(mg[1]); if (sn) return sn
+  const glob = T.match(/[A-Z0-9][A-Z0-9\-\/]{6,}/g) || []
+  for (const g of glob) {
+    if (!COMMON_WORD.test(g)) candidates.push({ tok: g, near: false })
   }
-  const line = (T.split(/\r?\n/).find((l) => labelRe.test(l)) || "").replace(labelRe, "")
-  const loose = line.match(/[A-Z0-9\-\/]{6,}/i)
-  if (loose?.[0]) {
-    const sn = selectBestSN(loose[0]); if (sn) return sn
+
+  // 4) Skor & pilih
+  let best = ""
+  let bestScore = -1
+  for (const c of candidates) {
+    const sc = scoreCandidate(c.tok, c.near)
+    if (sc > bestScore) { bestScore = sc; best = c.tok }
   }
-  const digits = T.match(/\b\d{8,}\b/)
-  if (digits?.[0]) {
-    const sn = selectBestSN(digits[0]); if (sn) return sn
-  }
-  return ""
+  if (!best) return ""
+
+  const final = selectBestSN(best)
+  return final ?? ""
 }
+
+/* ================= Gambar utils ================= */
+
 async function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve) => {
     const fr = new FileReader()
@@ -60,6 +121,7 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
     fr.readAsDataURL(blob)
   })
 }
+
 async function scaleUpDataUrl(dataUrl: string, factor = 2.5): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image()
@@ -77,6 +139,7 @@ async function scaleUpDataUrl(dataUrl: string, factor = 2.5): Promise<string> {
     img.src = dataUrl
   })
 }
+
 async function rotateDataUrl(dataUrl: string, deg: number): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image()
@@ -96,6 +159,9 @@ async function rotateDataUrl(dataUrl: string, deg: number): Promise<string> {
     img.src = dataUrl
   })
 }
+
+/* ================= Barcode (fallback) ================= */
+
 async function tryDecodeBarcodeFromDataUrl(dataUrl: string): Promise<string | null> {
   try {
     if (typeof window === "undefined") return null
@@ -106,11 +172,17 @@ async function tryDecodeBarcodeFromDataUrl(dataUrl: string): Promise<string | nu
     // @ts-ignore
     const result = await new BrowserMultiFormatReader().decodeFromImageElement(imgEl as HTMLImageElement)
     const txt = (result as any)?.getText?.() ?? ""
-    return selectBestSN(txt)
+    const norm = normalizeSN(txt)
+
+    // ⛔️ Abaikan EAN/UPC 12–14 digit (biasanya barcode produk, bukan SN)
+    if (/^\d{12,14}$/.test(norm)) return null
+
+    return selectBestSN(norm)
   } catch { return null }
 }
 
-/** ===== PUBLIC: OCR dengan mode cepat/deep ===== */
+/* ================= PUBLIC API ================= */
+
 export async function recognizeSerialNumber(
   imageSource: Blob | string,
   opts?: { onProgress?: OcrProgress; enableBarcode?: boolean; mode?: "fast" | "deep" }
@@ -122,7 +194,7 @@ export async function recognizeSerialNumber(
     onProgress?.({ status: "barcode", progress: 0 })
     const dataUrl = typeof imageSource === "string" ? imageSource : await blobToDataUrl(imageSource)
 
-    // 1) Barcode
+    // 1) Barcode dulu (tetap cepat), tapi sekarang EAN/UPC akan diabaikan
     if (enableBarcode) {
       const bc = await tryDecodeBarcodeFromDataUrl(dataUrl)
       if (bc) { onProgress?.({ status: "done", progress: 100 }); return bc }
@@ -155,7 +227,7 @@ export async function recognizeSerialNumber(
         // @ts-ignore
         const lines = (result.data?.lines ?? []) as Array<{ text: string }>
         const sn = extractSN(text, words, lines)
-        if (sn && sn.length >= 8) return sn
+        if (sn && sn.length >= 6) return sn
       }
       return null
     }
