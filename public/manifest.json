@@ -1,6 +1,6 @@
 {
   "name": "Sistem Laporan Otomatis Teknisi",
-  "short_name": "Laporan Teknisi",
+  "short_name": "Reaport",
   "description": "Aplikasi laporan otomatis untuk teknisi lapangan dan admin",
   "start_url": "/",
   "display": "standalone",
@@ -9,13 +9,13 @@
   "orientation": "portrait-primary",
   "icons": [
     {
-      "src": "/icon-192x192.png",
+      "src": "/logo-reaport.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "maskable any"
     },
     {
-      "src": "/icon-512x512.png",
+      "src": "/logo-reaport.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable any"
