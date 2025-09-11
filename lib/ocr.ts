@@ -6,17 +6,15 @@ export type OCRPhase = "idle" | "barcode" | "ocr" | "done" | "error";
 export interface OcrInfo { status: OCRPhase; progress: number; error?: string }
 export type OcrProgress = (info: OcrInfo) => void;
 
-/* ===== Normalisasi SN =====
-   - Perbaikan: buang suffix revisi seperti /r3, /R2, /V1, /A12 di *bagian akhir* string
-   - Koreksi karakter mirip (O/0, I/L/1, B/8, S/5) dalam konteks angka
-*/
+/* ================= Normalisasi & Seleksi ================= */
+
 export function normalizeSN(val: string) {
   let out = (val || "").toUpperCase();
 
   // rapikan spasi
   out = out.replace(/\s+/g, " ").trim();
 
-  // koreksi karakter mirip (hanya ketika diapit digit)
+  // koreksi karakter mirip ketika diapit digit
   out = out
     .replace(/Q(?=\d)/g, "0")
     .replace(/(?<=\d)O(?=\d)/g, "0")
@@ -24,91 +22,125 @@ export function normalizeSN(val: string) {
     .replace(/(?<=\d)B(?=\d)/g, "8")
     .replace(/(?<=\d)S(?=\d)/g, "5");
 
-  // keep A-Z 0-9, -, /
+  // simpan hanya A-Z 0-9 dan - /
   out = out.replace(/[^\w\-\/]/g, "");
 
-  // HAPUS suffix revisi di AKHIR: /r3, /R2, /v1, /A12 (maks 1 huruf opsional + 1-3 digit)
+  // buang suffix revisi di AKHIR, mis. /r3 /R2 /V1 /A12
   out = out.replace(/\/[A-Z]?\d{1,3}$/i, "");
 
   return out;
 }
 
-/* ===== Seleksi kandidat terbaik =====
-   - Terima alnum 8–20 yang mengandung huruf & angka
-   - Kalau numeric-only, minta >= 12 supaya tidak terpotong (contoh stiker panjang)
-*/
-function selectBestSN(raw: string): string | null {
-  const base = normalizeSN(raw);
-  const alnum = base.replace(/[^A-Z0-9]/g, "");
+/** Koreksi akhir kandidat:
+ * - 2 ↔ Z berdasarkan konteks huruf/angka
+ * - pangkas ekor huruf saja (noise) bila sudah ada huruf+angka
+ * - ambil run 8-20 alnum (huruf+angka) atau 9-20 digit (seri numeric)
+ */
+function postFixCandidate(raw: string): string | null {
+  let s = normalizeSN(raw);
 
-  // numeric panjang (mis. 0006028230300108)
-  if (/^\d{12,}$/.test(alnum)) return alnum;
+  // Jika diapit HURUF, '2' kemungkinan 'Z'
+  s = s.replace(/(?<=[A-Z])2(?=[A-Z])/g, "Z");
+  // Jika diapit DIGIT, 'Z' kemungkinan '2'
+  s = s.replace(/(?<=\d)Z(?=\d)/g, "2");
 
-  // pola 8+ alfanumerik harus ada huruf & angka
-  const m8 = alnum.match(/(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,}/);
-  if (m8) return m8[0];
+  // Bila sudah huruf+angka, buang ekor huruf murni (noise sebelah label lain)
+  if (/[A-Z]/.test(s) && /\d/.test(s)) {
+    s = s.replace(/[A-Z]{2,}$/g, "");
+  }
 
-  // fallback terkontrol
-  if (alnum.length >= 9 && alnum.length <= 20 && /[A-Z]/.test(alnum) && /\d/.test(alnum)) return alnum;
+  // Pilih run alnum 8–20 yang memuat huruf & angka
+  const alnum = s.match(/(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,20}/);
+  if (alnum) return alnum[0];
 
-  // terakhir: minimal 8
-  return alnum.length >= 8 ? alnum.slice(0, 8) : null;
+  // Atau bila numeric-only panjang 9–20
+  const digits = s.match(/\d{9,20}/);
+  if (digits) return digits[0];
+
+  return null;
 }
 
-/* ===== Ekstraksi dari teks OCR (mengutamakan yang berlabel SN/Serial) ===== */
+/** Pilih kandidat terbaik dari string longgar */
+function selectBestSN(loose: string): string | null {
+  const cleaned = normalizeSN(loose);
+  // coba urutan: alnum 8–20 (huruf+angka) → digit 12+ → digit 9–11
+  const a = cleaned.match(/(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{8,20}/);
+  if (a) return a[0];
+  const d12 = cleaned.match(/\d{12,20}/);
+  if (d12) return d12[0];
+  const d9 = cleaned.match(/\d{9,11}/);
+  if (d9) return d9[0];
+  return null;
+}
+
+/* ================ Ekstraksi dari hasil OCR ================ */
+
 function extractSN(
   ocrText: string,
   words?: Array<{ text: string }>,
   lines?: Array<{ text: string }>
 ) {
   const labelRe = /\b(?:S\/?N|SERIAL(?:\s*NO\.?|(?:\s*NUMBER)?))\b/i;
+  const T = (ocrText || "").toUpperCase();
 
-  // 1) Per-baris (paling kuat)
+  // 1) Per-baris setelah label (paling kuat)
   for (const L of (lines || [])) {
+    if (!L?.text) continue;
     if (labelRe.test(L.text)) {
-      const after = (L.text.split(labelRe)[1] ?? "");
-      const sn = selectBestSN(after);
-      if (sn) return sn;
+      // ambil run kandidat pertama setelah label pada baris tsb
+      const after = L.text.replace(/^.*?(?:S\/?N|SERIAL(?:\s*NO\.?|(?:\s*NUMBER)?))\b\s*[:#-]?\s*/i, "");
+      // potong sampai spasi ganda / label lain
+      const m = after.match(/[A-Z0-9\-\/ ]{5,}/i)?.[0] ?? after;
+      const cand = postFixCandidate(m) ?? selectBestSN(m);
+      if (cand) return cand;
     }
   }
 
-  // 2) Token setelah label
+  // 2) Token setelah label (maks 4 token sampai berhenti)
   if (words?.length) {
     for (let i = 0; i < words.length; i++) {
-      if (labelRe.test(words[i].text)) {
-        const sn = selectBestSN([(words[i + 1]?.text ?? ""), (words[i + 2]?.text ?? "")].join(" "));
-        if (sn) return sn;
+      if (labelRe.test(words[i]?.text || "")) {
+        let buf = "";
+        for (let j = i + 1; j < Math.min(words.length, i + 5); j++) {
+          const w = (words[j]?.text || "").toUpperCase();
+          if (!/^[A-Z0-9\-\/]+$/.test(w)) break;
+          buf += (buf ? "" : "") + w;
+          const fixed = postFixCandidate(buf);
+          if (fixed && fixed.length >= 8) return fixed;
+        }
+        const alt = postFixCandidate(buf) ?? selectBestSN(buf);
+        if (alt) return alt;
       }
     }
   }
 
-  // 3) Global pattern: label lalu deretan alnum
-  const T = (ocrText || "").toUpperCase();
+  // 3) Global: label lalu run alnum
   const mg = T.match(new RegExp(labelRe.source + String.raw`\s*[:#-]?\s*([A-Z0-9\s\-\/]{5,})`, "i"));
   if (mg?.[1]) {
-    const sn = selectBestSN(mg[1]);
-    if (sn) return sn;
+    const cand = postFixCandidate(mg[1]) ?? selectBestSN(mg[1]);
+    if (cand) return cand;
   }
 
-  // 4) Baris yang mengandung label → cari run alnum panjang
+  // 4) Bila ada baris berlabel, cari run alnum panjang di baris tsb
   const line = (T.split(/\r?\n/).find((l) => labelRe.test(l)) || "").replace(labelRe, "");
-  const loose = line.match(/[A-Z0-9\-\/]{6,}/i);
-  if (loose?.[0]) {
-    const sn = selectBestSN(loose[0]);
-    if (sn) return sn;
+  const loose = line.match(/[A-Z0-9\-\/]{6,}/i)?.[0];
+  if (loose) {
+    const cand = postFixCandidate(loose) ?? selectBestSN(loose);
+    if (cand) return cand;
   }
 
-  // 5) Fallback: deretan digit panjang (12+)
-  const digits = T.match(/\b\d{12,}\b/);
+  // 5) Fallback: run digit panjang
+  const digits = T.match(/\b\d{9,20}\b/);
   if (digits?.[0]) {
-    const sn = selectBestSN(digits[0]);
-    if (sn) return sn;
+    const cand = postFixCandidate(digits[0]) ?? digits[0];
+    if (cand) return cand;
   }
 
   return "";
 }
 
-/* ===== Helpers gambar ===== */
+/* ================== Helpers gambar ================== */
+
 async function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve) => {
     const fr = new FileReader();
@@ -155,7 +187,8 @@ async function rotateDataUrl(dataUrl: string, deg: number): Promise<string> {
   });
 }
 
-/* ===== Barcode via ZXing (fallback bila ada) ===== */
+/* ================ Barcode via ZXing (opsional) ================ */
+
 async function tryDecodeBarcodeFromDataUrl(dataUrl: string): Promise<string | null> {
   try {
     if (typeof window === "undefined") return null;
@@ -166,15 +199,16 @@ async function tryDecodeBarcodeFromDataUrl(dataUrl: string): Promise<string | nu
     // @ts-ignore
     const result = await new BrowserMultiFormatReader().decodeFromImageElement(imgEl as HTMLImageElement);
     const txt = (result as any)?.getText?.() ?? "";
-    const sn = selectBestSN(txt);
+    const sn = postFixCandidate(txt) ?? selectBestSN(txt);
     return sn;
   } catch { return null; }
 }
 
-/* ===== PUBLIC API =====
-   - mode: 'fast' hanya 1 rotasi (0°) PSM6 → sangat cepat
-   - mode: 'deep' tambah PSM7 & rotasi 90/180/270 untuk kasus sulit
-*/
+/* ===================== PUBLIC API ===================== */
+/** mode:
+ *  - 'fast' : 1 rotasi (0°) PSM6 → sangat cepat
+ *  - 'deep' : tambah PSM7 & rotasi 90/180/270 untuk kasus sulit
+ */
 export async function recognizeSerialNumber(
   imageSource: Blob | string,
   opts?: { onProgress?: OcrProgress; enableBarcode?: boolean; mode?: "fast" | "deep" }
@@ -203,23 +237,24 @@ export async function recognizeSerialNumber(
     const tryPSM = async (psm: 6 | 7, angs: readonly number[]) => {
       for (const ang of angs) {
         const du = ang === 0 ? scaled : await rotateDataUrl(scaled, ang);
-        // @ts-ignore
-        const result = await Tesseract.recognize(du, "eng", {
+        const result: any = await Tesseract.recognize(du, "eng", {
           // @ts-ignore
-          logger: (m) => m?.status === "recognizing text" && m?.progress != null &&
+          logger: (m: any) => m?.status === "recognizing text" && m?.progress != null &&
             onProgress?.({ status: "ocr", progress: Math.min(99, Math.round(10 + m.progress * 80)) }),
           // @ts-ignore
           tessedit_pageseg_mode: String(psm),
           preserve_interword_spaces: "1",
         });
 
-        const text = (result.data?.text ?? "").trim();
+        const text = (result?.data?.text ?? "").trim();
         // @ts-ignore
-        const words = (result.data?.words ?? []) as Array<{ text: string }>;
+        const words = (result?.data?.words ?? []) as Array<{ text: string }>;
         // @ts-ignore
-        const lines = (result.data?.lines ?? []) as Array<{ text: string }>;
+        const lines = (result?.data?.lines ?? []) as Array<{ text: string }>;
 
-        const sn = extractSN(text, words, lines);
+        const sn =
+          postFixCandidate(extractSN(text, words, lines)) ??
+          extractSN(text, words, lines);
         if (sn && sn.length >= 8) return sn;
       }
       return null;
