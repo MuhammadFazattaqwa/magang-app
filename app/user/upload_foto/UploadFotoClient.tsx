@@ -225,7 +225,7 @@ export default function UploadFotoClient() {
   const [savingCrop, setSavingCrop] = useState(false);
 
   // pagination
-  const perPage = 10;
+  const perPage = 15;
   const totalPages = Math.max(1, Math.ceil(categories.length / perPage));
   const slice = categories.slice((currentPage - 1) * perPage, (currentPage - 1) * perPage + perPage);
 
@@ -716,7 +716,7 @@ export default function UploadFotoClient() {
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-1 mb-4">
+              <div className="grid grid-cols-3 gap-1 mb-4">
                 {slice.map((category) => {
                   const status = getCategoryStatus(category);
                   const styles = getCategoryStyles(status);
